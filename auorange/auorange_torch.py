@@ -201,38 +201,3 @@ class LPC2Wav(torch.nn.Module):
 
 
         return pred
-
-
-class LPC2WavWithResidual(torch.nn.Module):
-    def __init__(self, lpc_order=4, clip_lpc=True):
-        super().__init__()
-
-        self.clip_lpc = clip_lpc
-        self.register_buffer("lpc_order", torch.tensor(lpc_order))
-
-    def forward(self, LPC_ctrl, residual):
-        '''
-        LPC_ctrl: B x lpc_order x T
-        residual: B x 1 x T
-
-        reconstructed: B x 1 x T
-        '''
-        LPC_ctrl = LPC_ctrl[:, :, :residual.shape[-1]]
-        num_points = LPC_ctrl.shape[-1]
-        if residual.shape[2] == num_points:
-            residual = F.pad(residual, (self.lpc_order, 0), 'constant')
-        elif residual.shape[2] != num_points + self.lpc_order:
-            raise RuntimeError('dimensions of lpcs and residual must match')
-
-        indices = (torch.arange(self.lpc_order).view(-1, 1) + torch.arange(LPC_ctrl.shape[-1]))
-        signal_slices = residual[:, :, indices]
-
-        # predict
-        pred = torch.sum(LPC_ctrl * signal_slices, dim=2)
-        if self.clip_lpc:
-            pred = torch.clip(pred, -1., 1.)
-
-        # add residual
-        reconstructed = pred + residual[:, :, self.lpc_order:]
-
-        return reconstructed
