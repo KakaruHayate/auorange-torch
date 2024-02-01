@@ -1,3 +1,5 @@
+使用torch实现，未支持MB-LPC
+
 # Auorange: LPC prediction for audios using mel spectrogram
 
 This repo contains codes that calculate linear prediction from mel spectrogram.
