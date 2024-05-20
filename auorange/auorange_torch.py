@@ -18,47 +18,15 @@ import torch.nn.functional as F
 from librosa.filters import mel as librosa_mel_fn
 
 
-class LevinsonDurbin(torch.nn.Module):
-    """levinson durbin's recursion
-    Args:
-        n (int): lpc order
-        pAC (tensor): autocorrelation [1, n+1, T]
-
-    Returns:
-        tensor: lpc coefficients [1, n, T]
-    """
-    def __init__(self, n):
-        super(LevinsonDurbin, self).__init__()
-        self.n = int(n)
-
-    def forward(self, pAC):
-        num_frames = pAC.shape[-1]
-        pLP = torch.zeros([1, self.n, num_frames], dtype=torch.float32)
-        pTmp = torch.zeros([self.n, num_frames], dtype=torch.float32)
-        E = pAC[0, 0, :].clone()
-
-        # 
-        for i in range(self.n):
-            ki = pAC[0, i + 1, :] + torch.sum(pLP[0, :i, :] * pAC[0, i - torch.arange(i), :], dim=0)
-            ki /= E
-            c = (1 - ki * ki).clamp(min=1e-5)
-            E *= c
-            pTmp[i, :] = -ki
-            for j in range(i):
-                pTmp[j, :] = pLP[0, j, :] - ki * pLP[0, i - j - 1, :]
-            pLP[0, :i, :] = pTmp[:i, :]
-            pLP[0, i, :] = pTmp[i, :]
-
-        return pLP
-
-
 class Audio2Mel(torch.nn.Module):
     def __init__(self, sampling_rate, hop_length, win_length, n_fft=None, 
-                 n_mel_channels=128, mel_fmin=0, mel_fmax=None, clamp=1e-5):
+                 n_mel_channels=128, mel_fmin=0, mel_fmax=None, clamp=1e-5, cpt_lpc=True, mel_base='e'):
         super().__init__()
 
         n_fft = win_length if n_fft is None else n_fft
 
+        self.mel_base = mel_base
+        self.cpt_lpc = cpt_lpc
         self.sampling_rate = sampling_rate
         self.hop_length = hop_length
         self.win_length = win_length
@@ -70,18 +38,16 @@ class Audio2Mel(torch.nn.Module):
                                    fmin=mel_fmin, fmax=mel_fmax)
         mel_basis = torch.from_numpy(mel_basis).float()
         self.register_buffer("mel_basis", mel_basis)
-
-        self.register_buffer("n_mel_channels", torch.tensor(n_mel_channels))
-
+        self.n_mel_channels = n_mel_channels
         self.hann_window = {}
 
 
     def forward(self, audio, keyshift=0, speed=1):
         '''
-        Args:
-            audio: B x C x T
+        Input:
+            audio: [B, 1, T]
         Returns:
-            log_mel_spec: B x n_mel x T 
+            log_mel_spec: [B, M, T] 
         '''
         factor = 2 ** (keyshift / 12)       
         n_fft_new = int(np.round(self.n_fft * factor))
@@ -93,10 +59,7 @@ class Audio2Mel(torch.nn.Module):
             self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(audio.device)
             
         B, C, T = audio.shape
-        if C > 1:
-            raise ValueError("Unsupported number of channels. Only mono (1) is allowed.")
-
-        audio = audio.reshape(B, T)
+        audio = audio.reshape(B * C, T)
         fft = torch.stft(audio, n_fft=n_fft_new, hop_length=hop_length_new,
                          win_length=win_length_new, window=self.hann_window[keyshift_key],
                          center=True, return_complex=True)
@@ -110,10 +73,25 @@ class Audio2Mel(torch.nn.Module):
             magnitude = magnitude[:, :size, :] * self.win_length / win_length_new
             
         mel_output = torch.matmul(self.mel_basis, magnitude)
-        # DDSP里面用的是log10，但是这个项目原先用的是log(1. + 10000 * mel_output)
-        log_mel_spec = torch.log10(torch.clamp(mel_output, min=self.clamp))
-        #log_mel_spec = torch.log(1. + 10000 * mel_output)
+        if self.mel_base == 'ori':
+            # In the original repo, the mel base number was set as follows:
+            log_mel_spec = torch.log(1. + 10000 * mel_output) 
+        elif self.mel_base == '10':
+            # At a certain period, the mel base number is 10
+            log_mel_spec = torch.log10(torch.clamp(mel_output, min=self.clamp))
+        elif self.mel_base == 'e':
+            # Nowadays, mel base number is set as the natural logarithm e (which is actually equivalent to the most primitive repo)
+            log_mel_spec = torch.log(torch.clamp(mel_output, min=self.clamp))
+        else:
+            raise ValueError("Unsupported mel base type")
+        
+        # log_mel_spec: B x C, M, T
+        T_ = log_mel_spec.shape[-1]
+        log_mel_spec = log_mel_spec.reshape(B, C, self.n_mel_channels ,T_)
+        log_mel_spec = log_mel_spec.permute(0, 3, 1, 2)
 
+        # print('og_mel_spec:', log_mel_spec.shape)
+        log_mel_spec = log_mel_spec.squeeze(2) # mono
 
         return log_mel_spec
 
@@ -121,12 +99,13 @@ class Audio2Mel(torch.nn.Module):
 class Mel2LPC(torch.nn.Module):
     def __init__(self, sampling_rate, hop_length, win_length, n_fft=None, 
                  n_mel_channels=128, mel_fmin=0, mel_fmax=None, repeat=None, f0=40., 
-                 lpc_order=4, clamp = 1e-12 ):
+                 lpc_order=4, clamp = 1e-12, mel_base='e'):
         super().__init__()
 
         n_fft = win_length if n_fft is None else n_fft
         repeat = hop_length if repeat is None else repeat
 
+        self.mel_base = mel_base
         self.sampling_rate = sampling_rate
         self.hop_length = hop_length
         self.win_length = win_length
@@ -147,70 +126,100 @@ class Mel2LPC(torch.nn.Module):
         mel_basis = torch.from_numpy(mel_basis).float()
         inv_mel_basis = torch.pinverse(mel_basis)
         self.register_buffer("inv_mel_basis", inv_mel_basis)
+        
+        
+    def LevinsonDurbin(self, pAC):
+        """levinson durbin's recursion
+        Input:
+            pAC (tensor): autocorrelation [1, n+1, T]
+
+        Returns:
+            tensor: lpc coefficients [1, n, T]
+        """
+        _, n_plus_1, num_frames = pAC.shape
+        n = n_plus_1 - 1 # Lpc_order is the dimension of the autocorrelation coefficient minus 1
+        pLP = torch.zeros([1, n, num_frames], dtype=torch.float32)
+        pTmp = torch.zeros([n, num_frames], dtype=torch.float32)
+        E = pAC[0, 0, :].clone()
+
+        for i in range(n):
+            ki = pAC[0, i + 1, :] + torch.sum(pLP[0, :i, :] * pAC[0, i - torch.arange(i), :], dim=0)
+            ki /= E
+            c = (1 - ki * ki).clamp(min=1e-5)
+            E *= c
+            pTmp[i, :] = -ki
+            for j in range(i):
+                pTmp[j, :] = pLP[0, j, :] - ki * pLP[0, i - j - 1, :]
+            pLP[0, :i, :] = pTmp[:i, :]
+            pLP[0, i, :] = pTmp[i, :]
+
+
+        return pLP
 
 
     def forward(self, mel):
         '''
-        Args:
-            mel: B x n_mel x T
+        Input:
+            mel: [1, M, T]
         Returns:
-            LPC_ctrl: B x lpc_order x T
+            lpc_ctrl: [1, lpc_order, T]
         '''
-        # mel_to_linear
-        mel = torch.pow(10, mel)
-        #mel = (torch.exp(mel) - 1.) / 10000
+        # mel to linear
+        if self.mel_base == 'ori':
+            mel = (torch.exp(mel) - 1.) / 10000
+        elif self.mel_base == 'e':
+            mel = torch.exp(mel)
+        elif self.mel_base == '10':
+            mel = torch.pow(10, mel)
+        else:
+            raise ValueError("Unsupported mel base type")
+        
         linear = torch.clamp_min(torch.matmul(self.inv_mel_basis, mel), self.clamp)
 
-        # linear_to_autocorrelation
+        # linear to autocorrelation
         power = linear**2
         flipped_power = torch.flip(power, dims=[1])[:,1:-1, :]
         fft_power = torch.cat([power, flipped_power], dim=1)
         auto_correlation = torch.fft.ifft(fft_power, dim=1).real
-
-        # autocorrelation_to_lpc
+        print(auto_correlation.shape)
+        
+        # autocorrelation to lpc
         auto_correlation = auto_correlation[:, 0:self.lpc_order + 1, :]
+        print(auto_correlation.shape)
+        print(self.lag_window.shape)
         auto_correlation = auto_correlation * self.lag_window
-
-        levinson_durbin = LevinsonDurbin(self.lpc_order)
-        LD_jit = torch.jit.script(levinson_durbin)
-        LPC_ctrl = LD_jit(auto_correlation)
-        LPC_ctrl = -1 * torch.flip(LPC_ctrl, dims=[1])
+        lpc_ctrl = self.LevinsonDurbin(auto_correlation)
+        lpc_ctrl = -1 * torch.flip(lpc_ctrl, dims=[1])
         if self.repeat is not None:
-            LPC_ctrl = torch.repeat_interleave(LPC_ctrl, self.repeat, dim=-1)
+            lpc_ctrl = torch.repeat_interleave(lpc_ctrl, self.repeat, dim=-1)
 
 
-        return LPC_ctrl
+        return lpc_ctrl
 
 
-class LPC2Wav(torch.nn.Module):
-    def __init__(self, lpc_order=4, clip_lpc=True):
-        super().__init__()
+def LPC2Wav(lpc_ctrl, wav, lpc_order, clip_lpc):
+    '''
+    lpc_ctrl: [1, lpc_order, T]
+    wav: [B, C, T]
+    lpc_order: int
+    clip_lpc:bool
 
-        self.clip_lpc = clip_lpc
-        self.register_buffer("lpc_order", torch.tensor(lpc_order))
+    pred: [B, C, T]
+    '''
+    lpc_ctrl = lpc_ctrl[:, :, :wav.shape[-1]]
+    num_points = lpc_ctrl.shape[-1]
+    if wav.shape[2] == num_points:
+        wav = F.pad(wav, (lpc_order, 0), 'constant')
+    elif wav.shape[2] != num_points + lpc_order:
+        raise RuntimeError('dimensions of lpcs and audio must match')
 
+    indices = (torch.arange(lpc_order).view(-1, 1) + torch.arange(lpc_ctrl.shape[-1]))
+    signal_slices = wav[:, :, indices]
 
-    def forward(self, LPC_ctrl, wav):
-        '''
-        LPC_ctrl: B x lpc_order x T
-        wav: B x 1 x T
-
-        pred: B x 1 x T
-        '''
-        LPC_ctrl = LPC_ctrl[:, :, :wav.shape[-1]]
-        num_points = LPC_ctrl.shape[-1]
-        if wav.shape[2] == num_points:
-            wav = F.pad(wav, (self.lpc_order, 0), 'constant')
-        elif wav.shape[2] != num_points + self.lpc_order:
-            raise RuntimeError('dimensions of lpcs and audio must match')
-
-        indices = (torch.arange(self.lpc_order).view(-1, 1) + torch.arange(LPC_ctrl.shape[-1]))
-        signal_slices = wav[:, :, indices]
-
-        # predict
-        pred = torch.sum(LPC_ctrl * signal_slices, dim=2)
-        if self.clip_lpc:
-            pred = torch.clip(pred, -1., 1.)
+    # predict
+    pred = torch.sum(lpc_ctrl * signal_slices, dim=2)
+    if clip_lpc:
+        pred = torch.clip(pred, -1., 1.)
 
 
-        return pred
+    return pred
