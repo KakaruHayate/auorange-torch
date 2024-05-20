@@ -181,12 +181,9 @@ class Mel2LPC(torch.nn.Module):
         flipped_power = torch.flip(power, dims=[1])[:,1:-1, :]
         fft_power = torch.cat([power, flipped_power], dim=1)
         auto_correlation = torch.fft.ifft(fft_power, dim=1).real
-        print(auto_correlation.shape)
         
         # autocorrelation to lpc
         auto_correlation = auto_correlation[:, 0:self.lpc_order + 1, :]
-        print(auto_correlation.shape)
-        print(self.lag_window.shape)
         auto_correlation = auto_correlation * self.lag_window
         lpc_ctrl = self.LevinsonDurbin(auto_correlation)
         lpc_ctrl = -1 * torch.flip(lpc_ctrl, dims=[1])
