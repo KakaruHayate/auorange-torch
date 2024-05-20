@@ -34,6 +34,7 @@ Predicted audio, original audio and error between two of them are
 
 ## TODO:
 
-- [ ] Add More comments
-- [ ] Extract audio feature using tensorflow
-- [ ] Extract audio feature using pytorch
+- [ ] ~Extract audio feature using tensorflow~
+- [x] Extract audio feature using pytorch
+- [ ] Batch extract
+- [ ] Support multiband lpc prediction
