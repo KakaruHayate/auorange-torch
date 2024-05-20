@@ -6,7 +6,7 @@ import numpy as np
 from mel2lpc.utils import plot, plot_spec, load_wav, save_wav
 from mel2lpc.mel2lpc_torch import Audio2Mel, Mel2LPC, LPC2Wav, PreEmphasis
 
-wav_name = 'wavs/2006000193.wav'
+wav_name = 'wavs/vox_1_0.wav'
 sample_rate = 44100
 n_fft = 2048
 num_mels = 128
@@ -67,8 +67,8 @@ wav_pred_mel = wav_pred_mel.squeeze(0).squeeze(0).numpy()
 error = residual.squeeze(0).squeeze(0).numpy()
 
 
-save_wav(wav_pred_mel, 'wavs/wav_pred_mel2006000193.wav', sample_rate)
-save_wav(error, 'wavs/error2006000193.wav', sample_rate)
+save_wav(wav_pred_mel, 'wavs/pred.wav', sample_rate)
+save_wav(error, 'wavs/error.wav', sample_rate)
 
 
 fig = plt.figure(figsize=(30, 5))
